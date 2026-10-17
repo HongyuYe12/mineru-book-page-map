@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pdf
+*.zip
+mineru-output/
+book-output/
+*.log.txt
+*.page-map.json
+*.page-map.md
+.DS_Store
+Thumbs.db
