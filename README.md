@@ -9,19 +9,19 @@
 - `book.md`：带 `<!-- pdf-page: N -->` 隐形页码标记的 Markdown。搜索结果可以直接定位到原 PDF 页。
 - `book.page-map.md`：人类可读的页码映射表，含 Markdown 行号、匹配来源和文本片段。
 - `book.page-map.json`：供脚本或其他检索系统使用的结构化索引。
-- `mineru_raw/`：MinerU 原始输出，保留 `content_list.json`、图片和中间文件，便于核对。
+- `mineru_raw/`：MinerU 原始输出，保留 `middle_json.json`、图片和中间文件，便于核对。
 - `mineru.log.txt`：MinerU 的标准输出和错误输出。
 
 转换结束前会自动执行严格验收：所有 PDF 页必须有 Markdown 页码标记，并且所有 Markdown 图片引用必须存在。验收失败时命令返回错误，不会把不完整结果当成成功。
 
-脚本优先使用 MinerU 的 `*_content_list.json` 中的 `page_idx`，其次识别 MinerU Markdown 已有的页码注释，最后才使用 PDF 文本抽取进行顺序匹配。扫描版 PDF 若 OCR 文本和 Markdown 差异很大，映射表会把无法确认的页标为 `matched = no`，不会伪造页码。
+脚本优先使用 MinerU 4 的 `middle_json.json`，从每页多个内容块中寻找可靠 Markdown 锚点；同时兼容旧版 `*_content_list.json`、已有页码注释和 PDF 文本回退。扫描版 PDF 若 OCR 文本和 Markdown 差异很大，严格验收会失败，不会伪造页码。
 
 ## Windows PowerShell 部署
 
 建议 Python 3.10 或更高版本。首次安装：
 
 ```powershell
-cd .\outputs\mineru-book-tool
+cd C:\Users\hongy\Desktop\MinerU\mineru-book-tool
 .\setup.ps1
 ```
 
@@ -103,8 +103,8 @@ PDF page 37 | Markdown line 812 | 量子纠缠可以通过……
 
 ## 常见问题
 
-**没有生成页码映射？** 检查 `mineru_raw/` 是否有 `*_content_list.json`，再查看 `mineru.log.txt`。如果 PDF 是纯扫描件，确保 MinerU 使用了 OCR/auto 模式，并人工抽查 `matched = no` 的页。
+**没有生成页码映射？** 先运行 `verify`，再检查 `mineru_raw/extracted/middle_json.json` 和 `mineru.log.txt`。已有原始结果时可运行 `rebuild`，无需重新推理。
 
-**MinerU 参数报错？** 先单独运行该版本的 `mineru --help`，然后把可用命令前缀通过 `--mineru-command` 传给脚本。脚本已经兼容是否支持 `-m auto` 两种形式，但不会猜测其他自定义参数。
+**MinerU 参数报错？** 先运行 `.\.venv\Scripts\mineru-kit.exe parse --help`，然后通过 `--mineru-command` 传入可执行文件完整路径。脚本优先使用 MinerU 4，并保留旧版 MinerU 3 的兼容回退。
 
 **如何更新？** 在虚拟环境中运行 `.\.venv\Scripts\python.exe -m pip install --upgrade "mineru>=4.0,<5"`，再用同一个输出目录重新执行转换。建议保留旧输出目录，便于比较页码映射变化。
