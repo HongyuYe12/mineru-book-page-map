@@ -1,7 +1,8 @@
-import json
 import io
+import json
 import tempfile
 import unittest
+from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -47,7 +48,7 @@ class MineruBookTests(unittest.TestCase):
             markdown.write_text("Preface match before any marker.\n", encoding="utf-8")
             index = {"markdown": str(markdown), "pages": []}
             (root / "book.page-map.json").write_text(json.dumps(index), encoding="utf-8")
-            args = type("Args", (), {"output_dir": str(root), "query": "match", "regex": False})()
+            args = Namespace(output_dir=str(root), query="match", regex=False)
             output = io.StringIO()
             with redirect_stdout(output):
                 tool.search(args)

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a PDF with MinerU and keep a searchable PDF-page mapping.
-
-The script deliberately treats MinerU as an external executable. MinerU has
-changed its CLI flags between releases, so the executable and backend are
-configurable instead of being hard-coded into a Python API integration.
-"""
+"""Convert PDFs with MinerU and preserve PDF page references."""
 
 from __future__ import annotations
 
@@ -17,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -106,14 +101,6 @@ def find_normalized(haystack: str, needle: str, start: int = 0) -> int | None:
     leading = len("".join(normalized_chars)) - len("".join(normalized_chars).lstrip())
     offset += leading
     return raw_offsets[offset] if offset < len(raw_offsets) else None
-
-
-def read_pdf_page_count(pdf_path: Path) -> int:
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("Missing pypdf. Install it with: python -m pip install pypdf") from exc
-    return len(PdfReader(str(pdf_path)).pages)
 
 
 def extract_pdf_pages(pdf_path: Path) -> list[str]:
@@ -210,8 +197,7 @@ def item_text(item: dict[str, Any]) -> str:
     return ""
 
 
-def find_content_list(output_root: Path, stem: str) -> Path | None:
-    # MinerU 4 ZIP: middle_json.json. MinerU 3: *_content_list.json.
+def find_structure_json(output_root: Path, stem: str) -> Path | None:
     candidates = list(output_root.rglob("*_content_list.json"))
     candidates += list(output_root.rglob("content_list.json"))
     candidates += list(output_root.rglob("middle_json.json"))
@@ -313,11 +299,8 @@ def run_mineru(pdf_path: Path, mineru_root: Path, command: str, backend: str) ->
     if not command_parts:
         raise ValueError("--mineru-command cannot be empty")
     zip_path = mineru_root / f"{pdf_path.stem}.zip"
-    # MinerU 4 stateless conversion. ZIP preserves Markdown, MiddleJson and images
-    # from one parse, so page metadata and rendered text stay in sync.
     tier = "standard" if backend == "auto" else backend
     v4 = command_parts + ["parse", str(pdf_path), "-o", str(zip_path), "--format", "zip", "--tier", tier]
-    # Legacy fallback for MinerU 3.x installations.
     legacy = command_parts + ["-p", str(pdf_path), "-o", str(mineru_root), "-m", backend]
     attempts = [v4, legacy]
     errors: list[str] = []
@@ -346,7 +329,6 @@ def run_mineru(pdf_path: Path, mineru_root: Path, command: str, backend: str) ->
                     archive.extractall(mineru_root / "extracted")
             return combined
         errors.append(f"$ {' '.join(argv)}\n{combined}")
-        # A second attempt is useful for older MinerU builds that do not have -m.
     raise RuntimeError("MinerU failed. Attempts:\n\n" + "\n\n".join(errors))
 
 
@@ -376,19 +358,19 @@ def insert_markers(markdown: str, positions: dict[int, int]) -> str:
 def build_mapping(
     markdown: str,
     pdf_pages: list[str],
-    content_list: Path | None,
+    structure_json: Path | None,
 ) -> tuple[str, list[PageEntry]]:
     markers = existing_markers(markdown)
     positions: dict[int, int] = {}
     sources: dict[int, str] = {}
     snippets: dict[int, str] = {}
 
-    if content_list:
+    if structure_json:
         try:
-            payload = json.loads(content_list.read_text(encoding="utf-8"))
+            payload = json.loads(structure_json.read_text(encoding="utf-8"))
             items = list(collect_page_items(payload)) or list(collect_json_items(payload))
         except (OSError, json.JSONDecodeError) as exc:
-            eprint(f"Warning: cannot read {content_list}: {exc}")
+            eprint(f"Warning: cannot read {structure_json}: {exc}")
             items = []
         cursor = 0
         for item in items:
@@ -409,7 +391,6 @@ def build_mapping(
                 if found is not None:
                     matched_anchor = str(anchor)
                     break
-            # Only fall back to a global search when no ordered anchor matched.
             if found is None:
                 for anchor in anchors:
                     found = find_normalized(markdown, str(anchor))
@@ -422,12 +403,10 @@ def build_mapping(
                 sources[page] = "mineru-block-anchor" if item.get("anchors") else "mineru-content-list"
                 cursor = found + len(matched_anchor)
 
-    # Existing markers are authoritative and do not need another insertion.
     for page, position in markers.items():
         positions.setdefault(page, position)
         sources.setdefault(page, "mineru-markdown-marker")
 
-    # Fallback for MinerU versions that omit content_list.json and page markers.
     cursor = 0
     for page, text in enumerate(pdf_pages, start=1):
         if page in positions:
@@ -445,7 +424,6 @@ def build_mapping(
     annotated = insert_markers(markdown, {page: pos for page, pos in positions.items() if page not in markers})
     entries: list[PageEntry] = []
     for page in range(1, len(pdf_pages) + 1):
-        # Re-scan after insertion: earlier markers shift later raw offsets.
         final_position = annotated.find(f"<!-- pdf-page: {page} -->")
         entries.append(
             PageEntry(
@@ -485,10 +463,46 @@ def write_page_map(path: Path, pdf_path: Path, markdown_path: Path, entries: lis
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def locate_outputs(root: Path, pdf_path: Path) -> tuple[Path, Path | None]:
-    mineru_root = root / "mineru_raw"
-    mineru_root.mkdir(parents=True, exist_ok=True)
-    return mineru_root, find_content_list(mineru_root, pdf_path.stem)
+def write_outputs(
+    pdf_path: Path,
+    output_dir: Path,
+    mineru_root: Path,
+    *,
+    log: str | None = None,
+    command: str | None = None,
+    backend: str | None = None,
+) -> dict[str, Any]:
+    pdf_pages = extract_pdf_pages(pdf_path)
+    raw_markdown = find_markdown(mineru_root, pdf_path.stem)
+    markdown = raw_markdown.read_text(encoding="utf-8", errors="replace")
+    structure_json = find_structure_json(mineru_root, pdf_path.stem)
+    annotated, entries = build_mapping(markdown, pdf_pages, structure_json)
+    markdown_path = output_dir / f"{pdf_path.stem}.md"
+    map_path = output_dir / f"{pdf_path.stem}.page-map.md"
+    json_path = output_dir / f"{pdf_path.stem}.page-map.json"
+    markdown_path.write_text(annotated, encoding="utf-8")
+    copied_images = copy_images(mineru_root, output_dir)
+    write_page_map(map_path, pdf_path, markdown_path, entries)
+    metadata = {
+        "source_pdf": str(pdf_path),
+        "markdown": str(markdown_path),
+        "page_map_markdown": str(map_path),
+        "page_count": len(pdf_pages),
+        "structure_json": str(structure_json) if structure_json else None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pages": [asdict(entry) for entry in entries],
+        "copied_images": copied_images,
+    }
+    if command is not None:
+        metadata["mineru_command"] = command
+    if backend is not None:
+        metadata["mineru_backend"] = backend
+    json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if log is not None:
+        (output_dir / "mineru.log.txt").write_text(log + "\n", encoding="utf-8")
+    report = verify_output(output_dir, strict=True)
+    report["copied_images"] = copied_images
+    return report
 
 
 def convert(args: argparse.Namespace) -> int:
@@ -497,55 +511,24 @@ def convert(args: argparse.Namespace) -> int:
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_pages = extract_pdf_pages(pdf_path)
-    if not pdf_pages:
-        raise RuntimeError("The PDF has no pages")
     mineru_root = output_dir / "mineru_raw"
     if args.clean and mineru_root.exists():
         shutil.rmtree(mineru_root)
     mineru_root.mkdir(parents=True, exist_ok=True)
     log = run_mineru(pdf_path, mineru_root, args.mineru_command, args.backend)
-    raw_markdown = find_markdown(mineru_root, pdf_path.stem)
-    markdown = raw_markdown.read_text(encoding="utf-8", errors="replace")
-    content_list = find_content_list(mineru_root, pdf_path.stem)
-    annotated, entries = build_mapping(markdown, pdf_pages, content_list)
-    markdown_path = output_dir / f"{pdf_path.stem}.md"
-    map_path = output_dir / f"{pdf_path.stem}.page-map.md"
-    json_path = output_dir / f"{pdf_path.stem}.page-map.json"
-    markdown_path.write_text(annotated, encoding="utf-8")
-    copied_images = copy_images(mineru_root, output_dir)
-    write_page_map(map_path, pdf_path, markdown_path, entries)
-    metadata = {
-        "source_pdf": str(pdf_path),
-        "markdown": str(markdown_path),
-        "page_map_markdown": str(map_path),
-        "page_count": len(pdf_pages),
-        "content_list": str(content_list) if content_list else None,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mineru_command": args.mineru_command,
-        "mineru_backend": args.backend,
-        "pages": [asdict(entry) for entry in entries],
-        "copied_images": copied_images,
-    }
-    json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (output_dir / "mineru.log.txt").write_text(log + "\n", encoding="utf-8")
-    matched = sum(entry.matched for entry in entries)
-    print(f"Markdown: {markdown_path}")
-    print(f"Page map: {map_path}")
-    print(f"JSON index: {json_path}")
-    print(f"Page mapping: {matched}/{len(entries)} pages matched")
-    print(f"Images copied: {copied_images}")
-    report = verify_output(output_dir, strict=True)
-    print(
-        "Verification: OK "
-        f"({report['matched_pages']}/{report['page_count']} pages, "
-        f"{report['image_references']} image references, 0 broken)"
+    report = write_outputs(
+        pdf_path,
+        output_dir,
+        mineru_root,
+        log=log,
+        command=args.mineru_command,
+        backend=args.backend,
     )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
 def rebuild(args: argparse.Namespace) -> int:
-    """Rebuild final files from existing MinerU raw output without inference."""
     pdf_path = Path(args.pdf).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     mineru_root = output_dir / "mineru_raw"
@@ -553,32 +536,7 @@ def rebuild(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
     if not mineru_root.is_dir():
         raise FileNotFoundError(f"MinerU raw output not found: {mineru_root}")
-    pdf_pages = extract_pdf_pages(pdf_path)
-    raw_markdown = find_markdown(mineru_root, pdf_path.stem)
-    markdown = raw_markdown.read_text(encoding="utf-8", errors="replace")
-    content_list = find_content_list(mineru_root, pdf_path.stem)
-    annotated, entries = build_mapping(markdown, pdf_pages, content_list)
-    markdown_path = output_dir / f"{pdf_path.stem}.md"
-    map_path = output_dir / f"{pdf_path.stem}.page-map.md"
-    json_path = output_dir / f"{pdf_path.stem}.page-map.json"
-    markdown_path.write_text(annotated, encoding="utf-8")
-    copied_images = copy_images(mineru_root, output_dir)
-    write_page_map(map_path, pdf_path, markdown_path, entries)
-    metadata = {
-        "source_pdf": str(pdf_path),
-        "markdown": str(markdown_path),
-        "page_map_markdown": str(map_path),
-        "page_count": len(pdf_pages),
-        "content_list": str(content_list) if content_list else None,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "rebuild_from_existing_raw": True,
-        "copied_images": copied_images,
-        "pages": [asdict(entry) for entry in entries],
-    }
-    json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    report = verify_output(output_dir, strict=True)
-    print(f"Rebuilt Markdown: {markdown_path}")
-    print(f"Images copied: {copied_images}")
+    report = write_outputs(pdf_path, output_dir, mineru_root)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
@@ -667,7 +625,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except Exception as exc:  # CLI errors should be readable without a traceback.
+    except Exception as exc:
         eprint(f"Error: {exc}")
         return 1
 

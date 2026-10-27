@@ -7,14 +7,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venv = Join-Path $root ".venv"
 $pythonExe = Join-Path $venv "Scripts\python.exe"
-$bundledPython = "C:\Users\hongy\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+$codexPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 
 function Resolve-PythonCommand {
     if (-not [string]::IsNullOrWhiteSpace($Python)) {
         return @{ Command = $Python; Arguments = @() }
-    }
-    if (Test-Path $bundledPython) {
-        return @{ Command = $bundledPython; Arguments = @() }
     }
     if (Get-Command python -ErrorAction SilentlyContinue) {
         return @{ Command = "python"; Arguments = @() }
@@ -22,7 +19,10 @@ function Resolve-PythonCommand {
     if (Get-Command py -ErrorAction SilentlyContinue) {
         return @{ Command = "py"; Arguments = @("-3") }
     }
-    throw "No usable Python was found. Install Python 3.10-3.12, then rerun setup.ps1."
+    if (Test-Path $codexPython) {
+        return @{ Command = $codexPython; Arguments = @() }
+    }
+    throw "Python 3 was not found. Install Python, then run setup.ps1 again."
 }
 
 if (-not (Test-Path $pythonExe)) {
